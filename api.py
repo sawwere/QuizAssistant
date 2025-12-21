@@ -1,13 +1,15 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks, Body
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from fastapi.openapi.utils import get_openapi
-from typing import Optional
+from typing import Optional, List, Dict
 import tempfile
 import os
 from pathlib import Path
+from pydantic import BaseModel
 
 from ollama_client import OllamaClient
 from quiz_service import QuizService, QuizConfig, QuizResult
+from test_models import ModelTester, QuestionDto, ModelTestResult
 
 # Инициализация приложения
 app = FastAPI(
@@ -19,6 +21,7 @@ app = FastAPI(
     - Автоматический выбор модели Ollama
     - Викторины с вопросами, требующими короткого ответа
     - Экспорт в JSON, Markdown и HTML форматах
+    - Тестирование языковых моделей на пользовательских вопросах
     """,
     contact={
         "name": "Викторина Генератор",
@@ -28,6 +31,13 @@ app = FastAPI(
 # Глобальные объекты
 ollama_client = None
 quiz_service = None
+model_tester = None
+
+# Модели Pydantic для запросов
+class ModelTestRequest(BaseModel):
+    """Запрос на тестирование модели"""
+    model_name: str
+    questions: List[QuestionDto]
 
 # Кастомная схема OpenAPI
 def custom_openapi():
@@ -55,6 +65,10 @@ def custom_openapi():
             "description": "Управление моделями Ollama",
         },
         {
+            "name": "Тестирование",
+            "description": "Тестирование моделей на вопросах",
+        },
+        {
             "name": "Система",
             "description": "Системные эндпоинты",
         }
@@ -68,7 +82,7 @@ app.openapi = custom_openapi
 @app.on_event("startup")
 async def startup_event():
     """Инициализация при запуске"""
-    global ollama_client, quiz_service
+    global ollama_client, quiz_service, model_tester
     
     ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
     
@@ -76,8 +90,10 @@ async def startup_event():
         # Автоматический выбор модели
         ollama_client = OllamaClient(base_url=ollama_url)
         quiz_service = QuizService(ollama_client)
-        print(f"[OK] Swagger UI доступен по адресу: http://localhost:8000/docs")
-        print(f"[INFO] OpenAPI спецификация: http://localhost:8000/openapi.json")
+        model_tester = ModelTester()
+        print("[OK] Swagger UI доступен по адресу: http://localhost:8000/docs")
+        print("[INFO] OpenAPI спецификация: http://localhost:8000/openapi.json")
+        print(f"[INFO] Модель по умолчанию: {ollama_client.get_current_model()}")
     except Exception as e:
         print(f"[ERROR] Ошибка инициализации: {e}")
         raise
@@ -447,6 +463,129 @@ async def pull_model(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка загрузки модели: {str(e)}")
+
+@app.post("/test/model", tags=["Тестирование"])
+async def test_model_on_questions(
+    test_request: ModelTestRequest = Body(..., description="Запрос на тестирование модели")
+):
+    """
+    Тестирование указанной модели на списке вопросов
+    
+    Модель отвечает на каждый вопрос, результаты возвращаются в формате JSON.
+    """
+    try:
+        if model_tester is None:
+            raise HTTPException(status_code=503, detail="Модуль тестирования не инициализирован")
+        
+        # Проверяем входные данные
+        if not test_request.model_name.strip():
+            raise HTTPException(status_code=400, detail="Название модели не может быть пустым")
+        
+        if not test_request.questions:
+            raise HTTPException(status_code=400, detail="Список вопросов не может быть пустым")
+        
+        print(f"[TEST] Запуск тестирования модели: {test_request.model_name}")
+        print(f"[TEST] Количество вопросов: {len(test_request.questions)}")
+        
+        # Запускаем тестирование
+        test_result = model_tester.test_model_on_questions(
+            model_name=test_request.model_name,
+            questions=test_request.questions,
+            base_url=os.getenv("OLLAMA_URL", "http://localhost:11434")
+        )
+        
+        # Преобразуем результат в словарь для JSON
+        result_dict = {
+            "modelName": test_result.modelName,
+            "questions": [
+                {
+                    "id": q.id,
+                    "questionText": q.questionText,
+                    "modelAnswer": q.modelAnswer,
+                    "correctAnswer": q.correctAnswer,
+                    "responseTime": q.responseTime
+                }
+                for q in test_result.questions
+            ],
+            "totalQuestions": test_result.totalQuestions,
+            "totalTime": test_result.totalTime,
+            "averageTime": test_result.averageTime
+        }
+        
+        return {
+            "success": True,
+            "testResult": result_dict,
+            "message": f"Тестирование завершено. Обработано {test_result.totalQuestions} вопросов."
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Ошибка тестирования модели: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка тестирования модели: {str(e)}")
+
+@app.post("/test/models/batch", tags=["Тестирование"])
+async def batch_test_models(
+    test_requests: Dict[str, List[QuestionDto]] = Body(..., description="Словарь {имя_модели: список_вопросов}")
+):
+    """
+    Пакетное тестирование нескольких моделей
+    
+    Принимает словарь, где ключ - название модели, значение - список вопросов.
+    Возвращает результаты для каждой модели.
+    """
+    try:
+        if model_tester is None:
+            raise HTTPException(status_code=503, detail="Модуль тестирования не инициализирован")
+        
+        if not test_requests:
+            raise HTTPException(status_code=400, detail="Словарь тестовых данных не может быть пустым")
+        
+        print(f"[TEST] Пакетное тестирование {len(test_requests)} моделей")
+        
+        # Запускаем пакетное тестирование
+        results = model_tester.batch_test_models(
+            model_questions_map=test_requests,
+            base_url=os.getenv("OLLAMA_URL", "http://localhost:11434")
+        )
+        
+        # Преобразуем результаты
+        results_dict = {}
+        for model_name, result in results.items():
+            if result:
+                results_dict[model_name] = {
+                    "modelName": result.modelName,
+                    "totalQuestions": result.totalQuestions,
+                    "totalTime": result.totalTime,
+                    "averageTime": result.averageTime,
+                    "questions": [
+                        {
+                            "id": q.id,
+                            "questionText": q.questionText,
+                            "modelAnswer": q.modelAnswer,
+                            "correctAnswer": q.correctAnswer,
+                            "responseTime": q.responseTime
+                        }
+                        for q in result.questions
+                    ]
+                }
+            else:
+                results_dict[model_name] = {
+                    "error": "Не удалось протестировать модель"
+                }
+        
+        return {
+            "success": True,
+            "results": results_dict,
+            "totalModelsTested": len([r for r in results.values() if r]),
+            "totalModelsFailed": len([r for r in results.values() if not r])
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Ошибка пакетного тестирования: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка пакетного тестирования: {str(e)}")
 
 # Обработчики ошибок
 @app.exception_handler(HTTPException)
